@@ -1963,6 +1963,30 @@ dcon::cb_type_id pick_fabrication_type(sys::state& state, dcon::nation_id from, 
 	}
 }
 
+bool naval_supremacy(sys::state& state, dcon::nation_id n, dcon::nation_id target) {
+	auto self_sup = state.world.nation_get_used_naval_supply_points(n);
+
+	auto real_target = state.world.overlord_get_ruler(state.world.nation_get_overlord_as_subject(target));
+	if(!real_target)
+		real_target = target;
+
+	if(self_sup <= state.world.nation_get_used_naval_supply_points(real_target))
+		return false;
+
+	if(self_sup <= state.world.nation_get_in_sphere_of(real_target).get_used_naval_supply_points())
+		return false;
+
+	for(auto a : state.world.nation_get_diplomatic_relation(real_target)) {
+		if(!a.get_are_allied())
+			continue;
+		auto other = a.get_related_nations(0) != real_target ? a.get_related_nations(0) : a.get_related_nations(1);
+		if(self_sup <= other.get_used_naval_supply_points())
+			return false;
+	}
+
+	return true;
+}
+
 bool valid_construction_target(sys::state& state, dcon::nation_id from, dcon::nation_id target) {
 	// Copied from commands.cpp:can_fabricate_cb()
 	if(from == target)
@@ -1988,8 +2012,23 @@ bool valid_construction_target(sys::state& state, dcon::nation_id from, dcon::na
 	if(nations::are_allied(state, target, from))
 		return false;
 
-	if(estimate_strength(state, target) * 0.5f > estimate_strength(state, from))
+	//GPs and SPs can consider trying to do wargoal justifications against non-neighboring nations
+	if(nations::is_great_power(state, from) || nations::get_status(state, from) == nations::status::secondary_power)
+		if(!state.world.get_nation_adjacency_by_nation_adjacency_pair(from, target)) {
+			if(state.world.nation_get_central_ports(target) == 0 || state.world.nation_get_central_ports(from) == 0) {
+				return false;
+			}
+			if(!naval_supremacy(state, from, target)) {
+				return false;
+			}
+		}
+	if(!state.world.get_nation_adjacency_by_nation_adjacency_pair(from, target)){
 		return false;
+	}
+
+	if(estimate_strength(state, from) + estimate_additional_offensive_strength(state, from, target) < (2.0f * estimate_defensive_strength(state, target)))
+		return false;
+
 	if(state.world.nation_get_owned_province_count(target) <= 3)
 		return false;
 	return true;
@@ -2012,7 +2051,9 @@ void update_cb_fabrication(sys::state& state) {
 				&& (!ol || ol == n.get_ai_rival())
 				&& !military::are_at_war(state, n, n.get_ai_rival())
 				&& !military::can_use_cb_against(state, n, n.get_ai_rival())
-				&& !military::has_truce_with(state, n, n.get_ai_rival())) {
+				&& !military::has_truce_with(state, n, n.get_ai_rival())
+				&& valid_construction_target(state, n, n.get_ai_rival())
+			) {
 
 				auto cb = pick_fabrication_type(state, n, n.get_ai_rival());
 				if(cb) {
@@ -2030,6 +2071,10 @@ void update_cb_fabrication(sys::state& state) {
 					auto t = possible_targets[rng::reduce(uint32_t(rng::get_random(state, uint32_t(n.id.index())) >> 2), uint32_t(possible_targets.size()))];
 					auto cb = pick_fabrication_type(state, n, t);
 					if(cb) {
+<<<<<<< Updated upstream
+=======
+						//n.set_constructing_cb_target(n.get_ai_rival());
+>>>>>>> Stashed changes
 						n.set_constructing_cb_target(t);
 						n.set_constructing_cb_type(cb);
 					}
@@ -2347,6 +2392,7 @@ void sort_avilable_declaration_cbs(std::vector<possible_cb>& result, sys::state&
 	});
 }
 
+//Add wargoals that are already available to use like "retake core" or "restore order"
 void add_free_ai_cbs_to_war(sys::state& state, dcon::nation_id n, dcon::war_id w) {
 	bool is_attacker = military::is_attacker(state, w, n);
 	if(!is_attacker && military::defenders_have_status_quo_wargoal(state, w))
@@ -2607,11 +2653,19 @@ void make_peace_offers(sys::state& state) {
 			if(overall_score >= 0) { // attacker winning
 				auto total_po_cost = military::attacker_peace_cost(state, w);
 				if(w.get_primary_attacker().get_is_player_controlled() == false) { // attacker makes offer
+					//Actually are we winning a lot? add more wargoals
+					if(overall_score >= total_po_cost && state.world.nation_get_infamy(w.get_primary_attacker()) < (state.defines.badboy_limit * 0.75f)) {
+						add_wg_to_great_war(state, w.get_primary_attacker(), w);
+					}
 					if(overall_score >= 100 || (overall_score >= 50 && overall_score >= total_po_cost * 2)) {
 						send_offer_up_to(w.get_primary_attacker(), w.get_primary_defender(), w, true, int32_t(overall_score), false);
 						continue;
 					}
 					if(w.get_primary_defender().get_is_player_controlled() == false) {
+						if(overall_score >= total_po_cost && state.world.nation_get_infamy(w.get_primary_defender()) < (state.defines.badboy_limit * 0.75f)) {
+							add_wg_to_great_war(state, w.get_primary_defender(), w);
+							continue;
+						}
 						auto war_duration = state.current_date.value - state.world.war_get_start_date(w).value;
 						if(war_duration >= 365) {
 							float willingness_factor = float(war_duration - 365) * 10.0f / 365.0f;
@@ -2623,6 +2677,11 @@ void make_peace_offers(sys::state& state) {
 						}
 					}
 				} else if(w.get_primary_defender().get_is_player_controlled() == false) { // defender may surrender
+					//No deathwars
+					if(state.world.nation_get_war_exhaustion(w.get_primary_defender()) == 100){
+						send_offer_up_to(w.get_primary_defender(), w.get_primary_attacker(), w, false, int32_t(overall_score), true);
+						continue;
+					}
 					if(overall_score >= 100 || (overall_score >= 50 && overall_score >= total_po_cost * 2)) {
 						send_offer_up_to(w.get_primary_defender(), w.get_primary_attacker(), w, false, int32_t(overall_score), true);
 						continue;
@@ -2647,6 +2706,10 @@ void make_peace_offers(sys::state& state) {
 						}
 					}
 				} else if(w.get_primary_attacker().get_is_player_controlled() == false) { // attacker may surrender
+					if(state.world.nation_get_war_exhaustion(w.get_primary_attacker()) == 100) {
+						send_offer_up_to(w.get_primary_attacker(), w.get_primary_defender(), w, true, int32_t(-overall_score), true);
+						continue;
+					}
 					if(overall_score <= -100 || (overall_score <= -50 && overall_score <= -total_po_cost * 2)) {
 						send_offer_up_to(w.get_primary_attacker(), w.get_primary_defender(), w, true, int32_t(-overall_score), true);
 						continue;
@@ -2682,6 +2745,11 @@ bool will_accept_peace_offer_value(sys::state& state,
 		overall_po_value = -overall_po_value;
 	}
 
+	//No deathwars, surrender to get that exhaustion back to 50% and lower
+	if(state.world.nation_get_war_exhaustion(n) == 100) {
+		return true;
+	}
+
 	auto personal_score_saved = personal_po_value - potential_peace_score_against;
 
 	if((prime_attacker == n || prime_defender == n) && (prime_attacker == from || prime_defender == from)) {
@@ -2708,7 +2776,7 @@ bool will_accept_peace_offer_value(sys::state& state,
 		if(scoreagainst_me > 50)
 			return true;
 
-		if(overall_score < 0.0f) { // we are losing
+		if(overall_score < 0.0f && estimate_strength(state, n) + estimate_additional_offensive_strength(state, n, from) > (0.5f * estimate_defensive_strength(state, from))) { // we are losing, but we could make a comeback
 			if(my_side_against_target - scoreagainst_me <= overall_po_value + personal_score_saved)
 				return true;
 		} else {
@@ -2722,7 +2790,7 @@ bool will_accept_peace_offer_value(sys::state& state,
 		if(scoreagainst_me > 50 && scoreagainst_me > -overall_po_value * 2)
 			return true;
 
-		if(overall_score < 0.0f) { // we are losing	
+		if(overall_score < 0.0f && estimate_strength(state, n) + estimate_additional_offensive_strength(state, n, from) > (0.5f * estimate_defensive_strength(state, from))) { // we are losing, but we could make a comeback
 			if(personal_score_saved > 0 && scoreagainst_me + personal_score_saved - my_po_target >= -overall_po_value)
 				return true;
 
@@ -2750,6 +2818,11 @@ bool will_accept_peace_offer(sys::state& state, dcon::nation_id n, dcon::nation_
 	int32_t my_po_target = 0;
 
 	auto concession = state.world.peace_offer_get_is_concession(p);
+
+	//No deathwars, surrender to get that exhaustion back to 50% and lower
+	if(state.world.nation_get_war_exhaustion(n) == 100) {
+		return true;
+	}
 
 	if(concession && overall_score <= -50.0f) {
 		return true;
@@ -2821,7 +2894,7 @@ bool will_accept_peace_offer(sys::state& state, dcon::nation_id n, dcon::nation_
 			}
 		}
 
-		if(overall_score < 0.0f) { // we are losing
+		if(overall_score < 0.0f && estimate_strength(state, n) + estimate_additional_offensive_strength(state, n, from) >(0.5f * estimate_defensive_strength(state, from))) { // we are losing, but we could make a comeback
 			if(my_side_against_target - scoreagainst_me <= overall_po_value + personal_score_saved)
 				return true;
 		} else {
@@ -2837,7 +2910,7 @@ bool will_accept_peace_offer(sys::state& state, dcon::nation_id n, dcon::nation_
 		if(scoreagainst_me > 50 && scoreagainst_me > -overall_po_value * 2)
 			return true;
 
-		if(overall_score < 0.0f) { // we are losing	
+		if(overall_score < 0.0f && estimate_strength(state, n) + estimate_additional_offensive_strength(state, n, from) >(0.5f * estimate_defensive_strength(state, from))) { // we are losing, but we could make a comeback
 			if(personal_score_saved > 0 && scoreagainst_me + personal_score_saved - my_po_target >= -overall_po_value)
 				return true;
 
@@ -2847,30 +2920,6 @@ bool will_accept_peace_offer(sys::state& state, dcon::nation_id n, dcon::nation_
 		}
 	}
 	return false;
-}
-
-bool naval_supremacy(sys::state& state, dcon::nation_id n, dcon::nation_id target) {
-	auto self_sup = state.world.nation_get_used_naval_supply_points(n);
-
-	auto real_target = state.world.overlord_get_ruler(state.world.nation_get_overlord_as_subject(target));
-	if(!real_target)
-		real_target = target;
-
-	if(self_sup <= state.world.nation_get_used_naval_supply_points(real_target))
-		return false;
-
-	if(self_sup <= state.world.nation_get_in_sphere_of(real_target).get_used_naval_supply_points())
-		return false;
-
-	for(auto a : state.world.nation_get_diplomatic_relation(real_target)) {
-		if(!a.get_are_allied())
-			continue;
-		auto other = a.get_related_nations(0) != real_target ? a.get_related_nations(0) : a.get_related_nations(1);
-		if(self_sup <= other.get_used_naval_supply_points())
-			return false;
-	}
-
-	return true;
 }
 
 void make_war_decs(sys::state& state) {
